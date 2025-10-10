@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
+from sklearn.decomposition import PCA # 用于降维
 
 def load_and_prepare_data(args):
     """
@@ -46,7 +47,21 @@ def load_and_prepare_data(args):
         else:
             raise ValueError("无法确定图2的节点数量：'x2' 和 'edge_index2' 均缺失或为空。")
 
-    # --- 核心修改：在堆叠前，对齐特征维度 ---
+# --- 根据命令行参数执行PCA降维 (已修复缩进) ---
+    if args.use_pca and x1 is not None and x1.shape[1] > args.pca_dim:
+        print(f"--- 正在对输入特征进行PCA降维 (从 {x1.shape[1]}维 -> {args.pca_dim}维) ---")
+
+        # 将两个特征矩阵合并进行PCA，保证变换空间的一致性
+        combined_x = np.vstack((x1, x2))
+        pca = PCA(n_components=args.pca_dim)
+        transformed_x = pca.fit_transform(combined_x)
+
+        # 重新切分回 x1 和 x2
+        x1 = transformed_x[:x1.shape[0], :]
+        x2 = transformed_x[x1.shape[0]:, :]
+        print(f"  - PCA降维完成。新特征维度: {x1.shape[1]}")
+
+    # --- 核心:在堆叠前，对齐特征维度 ---
     if x1.shape[1] != x2.shape[1]:
         print("警告: 两个图的特征维度不匹配。将对维度较小的特征矩阵进行零填充。")
         dim1, dim2 = x1.shape[1], x2.shape[1]

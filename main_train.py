@@ -3,19 +3,20 @@ import torch.optim as optim
 import argparse
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+import torch.nn.functional as F
 
 # 本地模块导入
 from data_loader import load_and_prepare_data
 from model import NodeEmbeddingModel
 
 def get_args():
-    parser = argparse.ArgumentParser(description="ESA-based Node Embedding Model Training")
+    parser = argparse.ArgumentParser(description="Advanced ESA Model Training with InfoNCE Loss")
 
     # --- 数据相关参数 ---
     data_group = parser.add_argument_group('Data Parameters')
-    data_group.add_argument('--data_path', type=str, default='datasets/ACM-DBLP_0.2.npz',help='输入数据文件的路径 (.npz格式)')
+    data_group.add_argument('--data_path', type=str, default='datasets/Douban_0.2.npz',help='输入数据文件的路径 (.npz格式)')
     data_group.add_argument('--split_ratios', type=float, nargs=3, default=[0.15, 0.05, 0.8],
-                            help='训练集、验证集、测试集的比例。三者之和应为1.0。示例: 0.15 0.05 0.8')
+                            help='训练集、验证集、测试集的比例。')
     data_group.add_argument('--seed', type=int, default=42, help='用于数据划分和初始化的随机种子')
 
     # --- 模型架构参数 ---
@@ -26,76 +27,75 @@ def get_args():
     model_group.add_argument('--layer_types', type=str, nargs='+', default=['M', 'M', 'S'],
                              choices=['M', 'S'],
                              help="注意力层的类型序列 ('M' for Masked, 'S' for Standard)")
-    model_group.add_argument('--no_mlp', action='store_true',
-                             help='如果设置，则不在注意力块后使用MLP')
-    model_group.add_argument('--dropout', type=float, default=0.1,
-                             help='模型中使用的dropout率')
+    model_group.add_argument('--no_mlp', action='store_true',help='如果设置，则不在注意力块后使用MLP')
+    model_group.add_argument('--dropout', type=float, default=0.1,help='模型中使用的dropout率')
+    model_group.add_argument('--use_pca', action='store_true' ,help='是否对输入特征使用PCA降维')
+    model_group.add_argument('--pca_dim', type=int, default=128,help='PCA降维后的目标维度')
 
     # --- 训练过程参数 ---
     train_group = parser.add_argument_group('Training Parameters')
-    train_group.add_argument('--lr', type=float, default=0.001, help='学习率 (learning rate)')
-    train_group.add_argument('--weight_decay', type=float, default=1e-5, 
-                             help='权重衰减 (weight decay)')
-    train_group.add_argument('--epochs', type=int, default=500, help='训练轮数 (epochs)')
-    train_group.add_argument('--eval_interval', type=int, default=10, 
-                             help='每隔多少轮在验证集上评估一次')
-    train_group.add_argument('--margin', type=float, default=2.0, 
-                             help='损失函数中的间隔')
-    train_group.add_argument('--neg_sample_k', type=int, default=10, 
-                             help='困难负采样中的k值')
-    
+    train_group.add_argument('--lr', type=float, default=0.0005, help='学习率')
+    train_group.add_argument('--weight_decay', type=float, default=1e-5, help='权重衰减')
+    train_group.add_argument('--epochs', type=int, default=500, help='训练轮数')
+    train_group.add_argument('--eval_interval', type=int, default=10, help='评估间隔')
+    train_group.add_argument('--neg_sample_k', type=int, default=128, # InfoNCE 通常受益于更多的负样本
+                             help='每个正样本对使用的负样本数量')
+    train_group.add_argument('--temperature', type=float, default=0.1,
+                             help='InfoNCE loss 中的温度系数')
+
     # --- 运行设备参数 ---
     run_group = parser.add_argument_group('Runtime Parameters')
-    run_group.add_argument('--device', type=str, default='auto',
-                           help="device ('auto', 'cpu', 'cuda')")
+    run_group.add_argument('--device', type=str, default='auto',help="device ('auto', 'cpu', 'cuda')")
 
     args = parser.parse_args()
-
-    # --- 参数校验与后处理 ---
-    if not np.isclose(sum(args.split_ratios), 1.0):
-        raise ValueError(f"split_ratios 的总和必须为 1.0，当前为 {sum(args.split_ratios)}")
-    if len(args.hidden_dims) != len(args.num_heads) or len(args.hidden_dims) != len(args.layer_types):
-        raise ValueError("`hidden_dims`, `num_heads`, 和 `layer_types` 的列表长度必须一致。")
+    
+    # 后处理与校验
     if args.device == 'auto':
         args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
+    # 其他校验...
     return args
 
-def get_hard_negative_pairs(pos_pairs, embeds1, embeds2, k):
-    source_embeds = embeds1[pos_pairs[:, 0]]
-    sim_matrix = torch.matmul(source_embeds, embeds2.T)
-    _, top_k_indices = torch.topk(sim_matrix, k=k, dim=1)
+def get_negative_samples(pos_pairs, num_nodes_net2, k, device):
+    """
+    为每个正样本对随机采样k个负样本。
+    InfoNCE不一定需要困难负采样，随机采样通常效果已经很好，且效率更高。
+    """
+    pos_src = pos_pairs[:, 0].unsqueeze(1) # [N, 1]
+    neg_candidates = torch.randint(0, num_nodes_net2, (pos_pairs.shape[0], k), device=device) # [N, K]
     
-    neg_targets = []
-    for i in range(pos_pairs.shape[0]):
-        true_target_id = pos_pairs[i, 1]
-        possible_negatives = top_k_indices[i]
-        hard_neg_candidates = possible_negatives[possible_negatives != true_target_id]
-        if len(hard_neg_candidates) > 0:
-            chosen_neg_id = hard_neg_candidates[torch.randint(0, len(hard_neg_candidates), (1,))]
-            neg_targets.append(chosen_neg_id)
-        else:
-            rand_neg_id = torch.randint(0, embeds2.shape[0], (1,), device=pos_pairs.device)
-            neg_targets.append(rand_neg_id)
-    neg_targets = torch.cat(neg_targets, dim=0)
-    return torch.stack((pos_pairs[:, 0], neg_targets), dim=1)
+    # 简单地将源节点与随机负样本组合
+    neg_pairs_src = pos_src.expand(-1, k).flatten() # [N*K]
+    neg_pairs_tgt = neg_candidates.flatten() # [N*K]
+    
+    return neg_pairs_src, neg_pairs_tgt
+
+
+def info_nce_loss(pos_sim, neg_sim, temperature):
+    """
+    计算 InfoNCE Loss。
+    pos_sim: [N], 正样本对的相似度
+    neg_sim: [N, K], N个源节点分别与K个负样本的相似度
+    """
+    # 将正样本相似度也加入logits中
+    # logits 形状: [N, 1+K]
+    logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)
+    logits /= temperature
+    
+    # 标签是第一列 (正样本)
+    labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
+    
+    return F.cross_entropy(logits, labels)
+
 
 @torch.no_grad()
 def evaluate(model, data, split='val'):
-    """在指定的数据集（验证集或测试集）上评估模型"""
+    # 评估函数保持不变
     model.eval()
-    
     all_embeddings = model(data['features'], data['edge_index'], data['batch_mapping'])
     embeds1 = all_embeddings[:data['num_nodes_net1']]
     embeds2 = all_embeddings[data['num_nodes_net1']:]
 
-    if split == 'val':
-        pairs_to_eval = data['val_pairs']
-    elif split == 'test':
-        pairs_to_eval = data['test_pairs']
-    else:
-        raise ValueError("split 参数必须是 'val' 或 'test'")
-
+    pairs_to_eval = data[f'{split}_pairs']
     source_embeds = embeds1[pairs_to_eval[:, 0]]
     sim_matrix = cosine_similarity(source_embeds.cpu().numpy(), embeds2.cpu().numpy())
 
@@ -108,12 +108,8 @@ def evaluate(model, data, split='val'):
         ranks.append(rank + 1)
         
     ranks = np.array(ranks)
-    mrr = np.mean(1.0 / ranks)
-    hits_at_1 = np.mean(ranks <= 1)
-    hits_at_10 = np.mean(ranks <= 10)
-    
-    return mrr, hits_at_1, hits_at_10
-
+    mrr, h1, h10 = np.mean(1.0 / ranks), np.mean(ranks <= 1), np.mean(ranks <= 10)
+    return mrr, h1, h10
 
 def main(args):
     data = load_and_prepare_data(args)
@@ -129,12 +125,11 @@ def main(args):
     ).to(args.device)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    loss_fn = torch.nn.MarginRankingLoss(margin=args.margin)
-
+    
     best_mrr = 0.0
     best_model_state = None
 
-    print("\n--- 开始训练 ---")
+    print("\n--- 开始训练 (InfoNCE Loss) ---")
     for epoch in range(args.epochs):
         model.train()
         optimizer.zero_grad()
@@ -144,17 +139,26 @@ def main(args):
         embeds2 = all_embeddings[data['num_nodes_net1']:]
 
         pos_pairs = data['train_pairs']
-        neg_pairs = get_hard_negative_pairs(pos_pairs, embeds1.detach(), embeds2.detach(), k=args.neg_sample_k)
         
+        # --- 损失计算流程修改 ---
         pos_src_embeds = embeds1[pos_pairs[:, 0]]
         pos_tgt_embeds = embeds2[pos_pairs[:, 1]]
-        neg_src_embeds = embeds1[neg_pairs[:, 0]]
-        neg_tgt_embeds = embeds2[neg_pairs[:, 1]]
+        
+        # 1. 计算正样本对的余弦相似度
+        pos_sim = torch.sum(F.normalize(pos_src_embeds) * F.normalize(pos_tgt_embeds), dim=1)
 
-        pos_dist = torch.sum((pos_src_embeds - pos_tgt_embeds)**2, dim=1)
-        neg_dist = torch.sum((neg_src_embeds - neg_tgt_embeds)**2, dim=1)
-        target = -torch.ones(pos_dist.shape[0], device=args.device)
-        loss = loss_fn(pos_dist, neg_dist, target)
+        # 2. 获取负样本
+        neg_src_idx, neg_tgt_idx = get_negative_samples(pos_pairs, data['num_nodes_net2'], args.neg_sample_k, args.device)
+        neg_src_embeds = embeds1[neg_src_idx]
+        neg_tgt_embeds = embeds2[neg_tgt_idx]
+
+        # 3. 计算负样本对的余弦相似度
+        neg_sim_flat = torch.sum(F.normalize(neg_src_embeds) * F.normalize(neg_tgt_embeds), dim=1)
+        # 将其重塑为 [N, K] 的形状，以便每个正样本都有K个对应的负样本相似度
+        neg_sim = neg_sim_flat.view(pos_pairs.shape[0], args.neg_sample_k)
+        
+        # 4. 计算 InfoNCE Loss
+        loss = info_nce_loss(pos_sim, neg_sim, args.temperature)
 
         loss.backward()
         optimizer.step()
