@@ -49,9 +49,9 @@ def load_and_prepare_data(args):
         num_nodes_net2 = int(edge_index2.max() + 1); 
         x2 = np.eye(num_nodes_net2, dtype=np.float32)
 
-    # --- 引入特征维度对齐逻辑 ---
+    
     if x1.shape[1] != x2.shape[1]:
-        print(f"警告: 两个图的原始特征维度不匹配 ({x1.shape[1]} vs {x2.shape[1]})。将进行零填充。")
+        print(f"warnning: 两个图的原始特征维度不匹配 ({x1.shape[1]} vs {x2.shape[1]})。将进行零填充。")
         dim1, dim2 = x1.shape[1], x2.shape[1]
         if dim1 < dim2:
             padding = np.zeros((x1.shape[0], dim2 - dim1), dtype=np.float32)

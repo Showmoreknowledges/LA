@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from data_loader import load_and_prepare_data
 from model import NodeEmbeddingModel
 
-# ... get_args() 函数保持不变 ...
+
 def get_args():
     parser = argparse.ArgumentParser(description="Advanced ESA Model Training with Multi-Feature Fusion")
     # --- 数据相关参数 ---
@@ -88,11 +88,10 @@ def main(args):
     ).to(args.device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
-    # --- 【重要修复】删除了 verbose=True 参数 ---
     scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
     
     best_mrr, best_model_state = 0.0, None
-    print("\n--- 开始训练 (多特征融合 + 稳定训练机制) ---")
+    print("\n--- 开始训练 ---")
     for epoch in range(args.epochs):
         model.train()
         optimizer.zero_grad()
