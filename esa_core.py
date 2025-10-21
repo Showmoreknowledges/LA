@@ -55,21 +55,45 @@ class SAB(nn.Module):
 
 def get_adj_mask_from_edge_index_node(edge_index, batch_mapping, max_nodes, device):
     batch_size = int(batch_mapping.max().item() + 1)
-    
+
     adj_mask = torch.ones(
         size=(batch_size, max_nodes, max_nodes),
         device=device,
         dtype=torch.bool,
     )
-    
+
     edge_indices_unbatched = unbatch_edge_index(edge_index, batch_mapping)
-    
+
     for i, graph_edge_index in enumerate(edge_indices_unbatched):
-        num_nodes_in_graph = int(torch.max(graph_edge_index)) + 1
+        # ---------- 把全局索引转换为局部索引 ----------
+        # 有些实现的 unbatch 只筛边，不重映射。我们手动本地化：
+        # 局部节点编号从该 batch 内出现的最小编号开始
+        min_idx = torch.min(graph_edge_index)
+        graph_edge_index_local = graph_edge_index - min_idx
+        # ---------------------------------------------------------
+
+        # 安全检查（可留可删；调试期建议保留）
+        if (graph_edge_index_local < 0).any():
+            raise RuntimeError("Local index < 0 after normalization.")
+        num_nodes_in_graph = int(torch.max(graph_edge_index_local)) + 1
+        if num_nodes_in_graph > max_nodes:
+            raise RuntimeError(
+                f"num_nodes_in_graph({num_nodes_in_graph}) > max_nodes({max_nodes}). "
+                "请把 max_nodes 设为 >= 每张子图的节点数上限。"
+            )
+
+        # 先开放该子图实际节点区域
         adj_mask[i, :num_nodes_in_graph, :num_nodes_in_graph] = False
-        adj_mask[i, graph_edge_index[0, :], graph_edge_index[1, :]] = True
-        adj_mask[i, graph_edge_index[1, :], graph_edge_index[0, :]] = True
-        adj_mask[i].fill_diagonal_(True) # Mask self-attention
+
+        # 写入边（注意用局部索引）
+        src = graph_edge_index_local[0, :]
+        dst = graph_edge_index_local[1, :]
+        adj_mask[i, src, dst] = True
+        adj_mask[i, dst, src] = True
+
+        # 自环 mask
+        # fill_diagonal_ 只适用于 2D tensor，这里是 3D，需逐图处理
+        adj_mask[i].fill_diagonal_(True)
 
     return adj_mask
 
